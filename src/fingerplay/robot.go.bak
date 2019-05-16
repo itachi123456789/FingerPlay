@@ -1,0 +1,193 @@
+package main
+
+import (
+	"math/rand"
+	"sync"
+	"time"
+
+	log "code.google.com/p/log4go"
+)
+
+type RobotManager struct {
+	mux  sync.RWMutex
+	idle []*Robot
+}
+
+func NewRobotManager(uids []int) *RobotManager {
+	rm := &RobotManager{}
+	rm.init(uids)
+	return rm
+}
+
+func (rm *RobotManager) init(idles []int) {
+	for _, uid := range idles {
+		robot := NewRobot()
+		robot.Uid = uid
+		rm.idle = append(rm.idle, robot)
+	}
+}
+
+func (rm *RobotManager) GoGoGo(lv int) {
+	log.Debug("GoGoGo %d", lv)
+	if robot := rm.NextRobot(lv); robot != nil {
+		go func() {
+			if err := robot.PlayLoop(); err != nil {
+				log.Error("Robot %d play loop end with error: %s. level=%d. begin balance=%.0f. end balance=%.0f, win=%.0f", robot.Uid, err, robot.Level, robot.BeginBalance, robot.EndBalance, robot.EndBalance-robot.BeginBalance)
+			} else {
+				log.Debug("Robot %d play loop end succeed. level=%d. begin balance=%.0f. end balance=%.0f, win=%.0f", robot.Uid, robot.Level, robot.BeginBalance, robot.EndBalance, robot.EndBalance-robot.BeginBalance)
+			}
+
+			rm.Idle(robot)
+		}()
+	} else {
+		log.Warn("No more robots. level=%d", lv)
+	}
+	return
+}
+
+func (rm *RobotManager) NextRobot(lv int) (robot *Robot) {
+	rm.mux.Lock()
+	if len(rm.idle) > 0 {
+		robot = rm.idle[0]
+		rm.idle = rm.idle[1:]
+		robot.Reset()
+		robot.Level = lv
+	}
+	rm.mux.Unlock()
+
+	return
+}
+
+func (rm *RobotManager) Idle(robot *Robot) {
+	rm.mux.Lock()
+	rm.idle = append(rm.idle, robot)
+	rm.mux.Unlock()
+}
+
+type Robot struct {
+	rand         *rand.Rand
+	AccessToken  string  `json:"access_token"`
+	Level        int     `json:"level"`
+	MatchId      string  `json:"match_id"`
+	Round        int     `json:"round"`
+	Uid          int     `json:"uid"`
+	BeginBalance float64 `json:"begin_balance"`
+	EndBalance   float64 `json:"end_balance"`
+}
+
+func NewRobot() *Robot {
+	robot := &Robot{}
+	return robot
+}
+
+func (r *Robot) PlayLoop() (err error) {
+	request := &LoginAIRequest{}
+	request.Uid = r.Uid
+
+	response := &LoginAIResponse{}
+
+	if err = DefaultAccountManager.LoginAI(request, response); err != nil {
+		log.Error("LoginAI(%#v, %#v) failed: %s", request, response, err)
+		return
+	}
+
+	if response.Data.AccessToken == "" {
+		log.Error("LoginAI(%#v, %#v) failed: bad access token \"\"", request, response)
+		return ErrAccessToken
+	}
+
+	log.Debug("LoginAI(%#v, %#v) succeed", request, response)
+
+	r.AccessToken = response.Data.AccessToken
+
+	if err = r.Match(); err != nil {
+		log.Error("Robot %d match failed: %s", r.Uid, err)
+		return
+	}
+
+	for {
+		if err = r.Ready(); err != nil {
+			log.Error("Robot %d ready failed: %s", r.Uid, err)
+			break
+		}
+	}
+
+	return
+}
+
+func (r *Robot) Match() (err error) {
+	request := &MatchRequest{}
+	request.Level = r.Level
+	request.AccessToken = r.AccessToken
+
+	response := &MatchResponse{}
+
+	if err = DefaultLogicImpl.Match(request, response); err != nil {
+		return
+	}
+
+	if response.Code != ResponseCodeOK {
+		return ErrResponseCodeNotOK
+	}
+
+	log.Debug("Robot %d match succeed: %#v, %#v", request, response)
+
+	r.MatchId = response.Data.MatchId
+	r.Round = response.Data.Round
+
+	for _, cp := range response.Data.Competitors {
+		if cp.AccessToken != "" {
+			r.BeginBalance = cp.Balance
+		}
+	}
+	return
+}
+
+func (r *Robot) Ready() (err error) {
+	request := &ReadyRequest{}
+	request.Operate = r.NextOperate()
+	request.MatchId = r.MatchId
+	request.Round = r.Round
+	request.AccessToken = r.AccessToken
+
+	response := &ReadyResponse{}
+
+	if err = DefaultLogicImpl.Ready(request, response); err != nil {
+		return
+	}
+
+	if response.Code != ResponseCodeOK {
+		return ErrResponseCodeNotOK
+	}
+
+	log.Debug("Robot %d ready succeed: %#v, %#v", request, response)
+
+	r.Round = response.Data.Round
+
+	for _, result := range response.Data.Results {
+		if result.AccessToken != "" {
+			r.EndBalance = result.Balance
+			break
+		}
+	}
+	return
+}
+
+func (r *Robot) NextOperate() int {
+	return r.rand.Intn(3)
+}
+
+func (r *Robot) Reset() {
+	r.rand = rand.New(rand.NewSource(time.Now().UnixNano()))
+	r.AccessToken = ""
+	r.Level = 0
+	r.MatchId = ""
+	r.Round = 0
+	r.BeginBalance = 0.0
+	r.EndBalance = 0.0
+	return
+}
+
+var (
+	DefaultRobotManager *RobotManager
+)
